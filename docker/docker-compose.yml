@@ -1,0 +1,156 @@
+version: "3.9"
+
+services:
+  node0:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      NODE_ID: "node0"
+      NODE_ADDR: "node0:8080"
+      PEER_ADDRS: "node1:8081,node2:8082,node3:8083,node4:8084"
+      GRPC_PORT: "9090"
+      HTTP_PORT: "8080"
+      METRICS_PORT: "2112"
+      DATA_DIR: "/data"
+      BIND_HOST: "0.0.0.0"
+    volumes:
+      - node0-data:/data
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+      - "2112:2112"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 5s
+      timeout: 2s
+      retries: 12
+    networks:
+      - kv-net
+
+  node1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      NODE_ID: "node1"
+      NODE_ADDR: "node1:8081"
+      PEER_ADDRS: "node0:8080,node2:8082,node3:8083,node4:8084"
+      GRPC_PORT: "9091"
+      HTTP_PORT: "8081"
+      METRICS_PORT: "2113"
+      DATA_DIR: "/data"
+      BIND_HOST: "0.0.0.0"
+    volumes:
+      - node1-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8081/health || exit 1"]
+      interval: 5s
+      timeout: 2s
+      retries: 12
+    networks:
+      - kv-net
+
+  node2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      NODE_ID: "node2"
+      NODE_ADDR: "node2:8082"
+      PEER_ADDRS: "node0:8080,node1:8081,node3:8083,node4:8084"
+      GRPC_PORT: "9092"
+      HTTP_PORT: "8082"
+      METRICS_PORT: "2114"
+      DATA_DIR: "/data"
+      BIND_HOST: "0.0.0.0"
+    volumes:
+      - node2-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8082/health || exit 1"]
+      interval: 5s
+      timeout: 2s
+      retries: 12
+    networks:
+      - kv-net
+
+  node3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      NODE_ID: "node3"
+      NODE_ADDR: "node3:8083"
+      PEER_ADDRS: "node0:8080,node1:8081,node2:8082,node4:8084"
+      GRPC_PORT: "9093"
+      HTTP_PORT: "8083"
+      METRICS_PORT: "2115"
+      DATA_DIR: "/data"
+      BIND_HOST: "0.0.0.0"
+    volumes:
+      - node3-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8083/health || exit 1"]
+      interval: 5s
+      timeout: 2s
+      retries: 12
+    networks:
+      - kv-net
+
+  node4:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      NODE_ID: "node4"
+      NODE_ADDR: "node4:8084"
+      PEER_ADDRS: "node0:8080,node1:8081,node2:8082,node3:8083"
+      GRPC_PORT: "9094"
+      HTTP_PORT: "8084"
+      METRICS_PORT: "2116"
+      DATA_DIR: "/data"
+      BIND_HOST: "0.0.0.0"
+    volumes:
+      - node4-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8084/health || exit 1"]
+      interval: 5s
+      timeout: 2s
+      retries: 12
+    networks:
+      - kv-net
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9095:9090"
+    networks:
+      - kv-net
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_SECURITY_ADMIN_USER: "admin"
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ../monitoring/grafana-datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml:ro
+      - ../monitoring/grafana-dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+      - ../monitoring/grafana-dashboard.json:/var/lib/grafana/dashboards/kv-dashboard.json:ro
+    ports:
+      - "3000:3000"
+    networks:
+      - kv-net
+
+volumes:
+  node0-data:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:
+
+networks:
+  kv-net:
+    driver: bridge
