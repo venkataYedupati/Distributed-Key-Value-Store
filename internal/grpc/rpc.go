@@ -33,7 +33,7 @@ type LogEntry struct {
 	Term       uint64    `json:"term"`
 	Key        string    `json:"key"`
 	Value      string    `json:"value"`
-	Operation  string    `json:"operation"`
+	Op         string    `json:"op"`
 	TTLSeconds int64     `json:"ttl_seconds"`
 	Timestamp  time.Time `json:"timestamp"`
 }
@@ -88,6 +88,18 @@ type ProposeRequest struct {
 	TTLSeconds int64  `json:"ttl_seconds"`
 }
 
+type SnapshotRequest struct {
+	Term              uint64 `json:"term"`
+	LeaderID          string `json:"leader_id"`
+	LastIncludedIndex uint64 `json:"last_included_index"`
+	LastIncludedTerm  uint64 `json:"last_included_term"`
+	Data              []byte `json:"data"`
+}
+
+type SnapshotResponse struct {
+	Term uint64 `json:"term"`
+}
+
 type ProposeResponse struct {
 	Success   bool   `json:"success"`
 	LeaderID  string `json:"leader_id"`
@@ -122,6 +134,7 @@ type PeerServiceClient interface {
 	Propose(ctx context.Context, in *ProposeRequest, opts ...grpc.CallOption) (*ProposeResponse, error)
 	Read(ctx context.Context, in *ReadRequest, opts ...grpc.CallOption) (*ReadResponse, error)
 	Health(ctx context.Context, in *struct{}, opts ...grpc.CallOption) (*HealthResponse, error)
+	InstallSnapshot(ctx context.Context, in *SnapshotRequest, opts ...grpc.CallOption) (*SnapshotResponse, error)
 }
 
 type peerServiceClient struct {
@@ -180,10 +193,19 @@ func (c *peerServiceClient) Health(ctx context.Context, in *struct{}, opts ...gr
 	return out, nil
 }
 
+func (c *peerServiceClient) InstallSnapshot(ctx context.Context, in *SnapshotRequest, opts ...grpc.CallOption) (*SnapshotResponse, error) {
+	out := new(SnapshotResponse)
+	if err := c.cc.Invoke(ctx, "/distributedkv.PeerService/InstallSnapshot", in, out, opts...); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 type PeerServiceServer interface {
 	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
 	RequestVote(context.Context, *RequestVoteRequest) (*RequestVoteResponse, error)
 	AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResponse, error)
+	InstallSnapshot(context.Context, *SnapshotRequest) (*SnapshotResponse, error)
 	Propose(context.Context, *ProposeRequest) (*ProposeResponse, error)
 	Read(context.Context, *ReadRequest) (*ReadResponse, error)
 	Health(context.Context, *struct{}) (*HealthResponse, error)
@@ -197,6 +219,7 @@ func RegisterPeerServiceServer(s *grpc.Server, srv PeerServiceServer) {
 			{MethodName: "Heartbeat", Handler: heartbeatHandler},
 			{MethodName: "RequestVote", Handler: requestVoteHandler},
 			{MethodName: "AppendEntries", Handler: appendEntriesHandler},
+			{MethodName: "InstallSnapshot", Handler: installSnapshotHandler},
 			{MethodName: "Propose", Handler: proposeHandler},
 			{MethodName: "Read", Handler: readHandler},
 			{MethodName: "Health", Handler: healthHandler},
@@ -292,6 +315,21 @@ func healthHandler(srv any, ctx context.Context, dec func(any) error, intercepto
 	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: "/distributedkv.PeerService/Health"}
 	handler := func(ctx context.Context, req any) (any, error) {
 		return srv.(PeerServiceServer).Health(ctx, req.(*struct{}))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func installSnapshotHandler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
+	in := new(SnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PeerServiceServer).InstallSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: "/distributedkv.PeerService/InstallSnapshot"}
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(PeerServiceServer).InstallSnapshot(ctx, req.(*SnapshotRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }

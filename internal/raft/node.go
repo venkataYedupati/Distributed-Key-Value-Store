@@ -583,11 +583,7 @@ func (n *Node) proposeCommand(ctx context.Context, op, key, value string, ttl ti
 	if err := n.replicateEntry(ctx, entry); err != nil {
 		return err
 	}
-	n.mu.Lock()
-	n.commitIndex = entry.Index
-	n.metrics.SetCommitIndex(n.commitIndex)
-	n.signalCommit(entry.Index)
-	n.mu.Unlock()
+	// commit index advanced by replicateEntry via advanceCommitIndexLocked when quorum reached
 	n.notifyReplicators()
 	return nil
 }

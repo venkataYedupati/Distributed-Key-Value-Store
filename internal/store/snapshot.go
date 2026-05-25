@@ -85,16 +85,15 @@ func (e *Engine) ApplySnapshot(data []byte, lastIncludedIndex int64, lastInclude
 	if err := json.Unmarshal(decoded, &entries); err != nil {
 		return err
 	}
+	// perform delete+put in a single atomic batch while holding engine lock
 	keys, err := e.Keys()
 	if err != nil {
 		return err
 	}
-	for _, key := range keys {
-		if err := e.db.Delete([]byte(key), nil); err != nil {
-			return err
-		}
-	}
 	batch := new(leveldb.Batch)
+	for _, key := range keys {
+		batch.Delete([]byte(key))
+	}
 	for key, entry := range entries {
 		state := Entry{Key: key, Value: entry.Value, UpdatedAt: time.Now().UTC()}
 		if entry.ExpiresAt > 0 {
@@ -107,6 +106,8 @@ func (e *Engine) ApplySnapshot(data []byte, lastIncludedIndex int64, lastInclude
 		}
 		batch.Put([]byte(key), payload)
 	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if err := e.db.Write(batch, nil); err != nil {
 		return err
 	}

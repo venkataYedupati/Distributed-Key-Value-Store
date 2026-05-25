@@ -120,7 +120,7 @@ func ParsePeerEndpoints(input string) []PeerConfig {
 		}
 		host := fields[0]
 		httpPort := mustAtoi(fields[1])
-		peers = append(peers, PeerConfig{ID: host, Host: host, HTTPPort: httpPort, GRPCPort: httpPort + 1000})
+		peers = append(peers, PeerConfig{ID: host, Host: host, HTTPPort: httpPort, GRPCPort: httpPort + 1010})
 	}
 	return peers
 }

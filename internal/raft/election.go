@@ -9,27 +9,46 @@ import (
 	kvgrpc "distributed-kv-store/internal/grpc"
 )
 
-func electionTimeout() time.Duration {
-	return time.Duration(150+rand.Intn(151)) * time.Millisecond
+func (n *Node) electionTimeout() time.Duration {
+	base := n.cfg.ElectionTimeout
+	if base <= 0 {
+		base = 1500 * time.Millisecond
+	}
+	half := base / 2
+	return half + time.Duration(rand.Int63n(int64(half)))
 }
 
 func (n *Node) electionLoop(ctx context.Context) {
+	var observedHeartbeat time.Time
+	var deadline time.Time
+	tick := time.NewTicker(25 * time.Millisecond)
+	defer tick.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-n.stopCh:
 			return
-		case <-time.After(25 * time.Millisecond):
+		case <-tick.C:
 			if n.IsLeader() {
+				// reset deadline while leader
+				observedHeartbeat = time.Time{}
+				deadline = time.Time{}
 				continue
 			}
 			n.mu.RLock()
 			lastHeartbeat := n.lastHeartbeat
 			n.mu.RUnlock()
-			if time.Since(lastHeartbeat) < electionTimeout() {
+			if observedHeartbeat.IsZero() || lastHeartbeat.After(observedHeartbeat) {
+				observedHeartbeat = lastHeartbeat
+				deadline = observedHeartbeat.Add(n.electionTimeout())
+			}
+			if time.Now().Before(deadline) {
 				continue
 			}
+			// reset for next cycle
+			observedHeartbeat = time.Time{}
+			deadline = time.Time{}
 			n.startElection(ctx)
 		}
 	}
@@ -103,7 +122,11 @@ func (n *Node) startElection(ctx context.Context) {
 }
 
 func (n *Node) heartbeatLoop(ctx context.Context) {
-	ticker := time.NewTicker(50 * time.Millisecond)
+	interval := n.cfg.HeartbeatInterval
+	if interval <= 0 {
+		interval = 50 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {

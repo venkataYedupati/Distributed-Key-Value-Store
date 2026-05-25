@@ -11,7 +11,6 @@ import (
 	"distributed-kv-store/internal/config"
 	kvproto "distributed-kv-store/proto/kv"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/status"
 )
@@ -46,7 +45,7 @@ func (c *Client) dialPeer(peerID string) (*grpc.ClientConn, error) {
 	}
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
-		conn, err := grpc.Dial(peer.GRPCAddr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := Dial(peer.GRPCAddr())
 		if err == nil {
 			c.conns[peerID] = conn
 			return conn, nil
@@ -227,6 +226,14 @@ func (c *Client) Health(ctx context.Context, peerID string) (*HealthResponse, er
 		return nil, err
 	}
 	return NewPeerServiceClient(conn).Health(ctx, &struct{}{})
+}
+
+func (c *Client) InstallSnapshot(ctx context.Context, peerID string, req *SnapshotRequest) (*SnapshotResponse, error) {
+	conn, err := c.connFor(peerID)
+	if err != nil {
+		return nil, err
+	}
+	return NewPeerServiceClient(conn).InstallSnapshot(ctx, req)
 }
 
 func (c *Client) Peer(peerID string) (config.PeerConfig, bool) {
