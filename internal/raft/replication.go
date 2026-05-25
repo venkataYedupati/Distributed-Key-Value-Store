@@ -4,11 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
+	"log"
 	"time"
 
 	kvgrpc "distributed-kv-store/internal/grpc"
-	kvproto "distributed-kv-store/proto/kv"
 )
 
 func (n *Node) startReplicationLoops(ctx context.Context) {
@@ -44,29 +43,46 @@ func (n *Node) replicateEntry(ctx context.Context, entry LogEntry) error {
 		return errors.New("not leader")
 	}
 	peers := n.clusterPeers()
-	var wg sync.WaitGroup
-	errCh := make(chan error, len(peers))
+	// replicate to peers concurrently and stop once quorum is reached
+	total := len(peers)
+	needed := n.quorum()
+	ackCh := make(chan bool, total)
+	// launch replication goroutines
+	remaining := 0
 	for _, peer := range peers {
 		if peer.ID == n.cfg.NodeID {
 			continue
 		}
-		wg.Add(1)
-		go func(peerID string) {
-			defer wg.Done()
-			if _, err := n.replicatePeer(ctx, peerID); err != nil {
-				errCh <- err
+		remaining++
+		peerID := peer.ID
+		go func(pid string) {
+			ok, err := n.replicatePeer(ctx, pid)
+			if err != nil {
+				ackCh <- false
+				return
 			}
-		}(peer.ID)
+			ackCh <- ok
+		}(peerID)
 	}
-	wg.Wait()
-	close(errCh)
+
+	// count acknowledgements (include self)
+	acks := 1
+	for i := 0; i < remaining; i++ {
+		ok := <-ackCh
+		if ok {
+			acks++
+		}
+		if acks >= needed {
+			n.mu.Lock()
+			n.advanceCommitIndexLocked()
+			n.mu.Unlock()
+			return nil
+		}
+	}
 	n.mu.Lock()
 	n.advanceCommitIndexLocked()
 	n.mu.Unlock()
-	if len(errCh) > 0 {
-		return <-errCh
-	}
-	return nil
+	return errors.New("quorum not reached")
 }
 
 func (n *Node) replicatePeer(ctx context.Context, peerID string) (bool, error) {
@@ -88,19 +104,22 @@ func (n *Node) replicatePeer(ctx context.Context, peerID string) (bool, error) {
 			if err != nil {
 				return false, err
 			}
-			resp, err := n.clients.SendInstallSnapshot(peerID, &kvproto.SnapshotRequest{
-				Term:              term,
-				LeaderId:          leaderID,
-				LastIncludedIndex: lastIncludedIndex,
-				LastIncludedTerm:  lastIncludedTerm,
+			log.Printf("replicatePeer: installing snapshot to %s term=%d snapshotIndex=%d lastIncludedIndex=%d", peerID, term, snapshotIndex, lastIncludedIndex)
+			resp, err := n.clients.InstallSnapshot(context.Background(), peerID, &kvgrpc.SnapshotRequest{
+				Term:              uint64(term),
+				LeaderID:          leaderID,
+				LastIncludedIndex: uint64(lastIncludedIndex),
+				LastIncludedTerm:  uint64(lastIncludedTerm),
 				Data:              data,
 			})
 			if err != nil {
+				log.Printf("replicatePeer: InstallSnapshot to %s failed: %v", peerID, err)
 				return false, err
 			}
-			if resp.Term > term {
+			log.Printf("replicatePeer: InstallSnapshot response from %s: term=%d", peerID, resp.Term)
+			if int64(resp.Term) > term {
 				n.mu.Lock()
-				n.becomeFollowerLocked(resp.Term, "")
+				n.becomeFollowerLocked(int64(resp.Term), "")
 				n.mu.Unlock()
 				return false, nil
 			}
@@ -123,31 +142,34 @@ func (n *Node) replicatePeer(ctx context.Context, peerID string) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		protoEntries := make([]*kvproto.LogEntry, 0, len(entries))
+		peerEntries := make([]kvgrpc.LogEntry, 0, len(entries))
 		for i := range entries {
-			protoEntries = append(protoEntries, &kvproto.LogEntry{
-				Index:      entries[i].Index,
-				Term:       entries[i].Term,
+			peerEntries = append(peerEntries, kvgrpc.LogEntry{
+				Index:      uint64(entries[i].Index),
+				Term:       uint64(entries[i].Term),
 				Op:         entries[i].Op,
 				Key:        entries[i].Key,
 				Value:      entries[i].Value,
-				TtlSeconds: entries[i].TTL,
+				TTLSeconds: entries[i].TTL,
 			})
 		}
-		resp, err := n.clients.SendAppendEntries(peerID, &kvproto.AppendEntriesRequest{
-			Term:         term,
-			LeaderId:     leaderID,
-			PrevLogIndex: prevIndex,
-			PrevLogTerm:  prevTerm,
-			Entries:      protoEntries,
-			LeaderCommit: leaderCommit,
+		log.Printf("replicatePeer: AppendEntries -> %s nextIndex=%d prevIndex=%d prevTerm=%d entries=%d leaderCommit=%d", peerID, nextIndex, prevIndex, prevTerm, len(entries), leaderCommit)
+		resp, err := n.clients.AppendEntries(context.Background(), peerID, &kvgrpc.AppendEntriesRequest{
+			Term:         uint64(term),
+			LeaderID:     leaderID,
+			PrevLogIndex: uint64(prevIndex),
+			PrevLogTerm:  uint64(prevTerm),
+			Entries:      peerEntries,
+			LeaderCommit: uint64(leaderCommit),
 		})
 		if err != nil {
+			log.Printf("replicatePeer: AppendEntries to %s failed: %v", peerID, err)
 			return false, err
 		}
-		if resp.Term > term {
+		log.Printf("replicatePeer: AppendEntries response from %s: term=%d success=%v matchIndex=%d conflictIndex=%d conflictTerm=%d", peerID, resp.Term, resp.Success, resp.MatchIndex, resp.ConflictIndex, resp.ConflictTerm)
+		if int64(resp.Term) > term {
 			n.mu.Lock()
-			n.becomeFollowerLocked(resp.Term, "")
+			n.becomeFollowerLocked(int64(resp.Term), "")
 			n.mu.Unlock()
 			return false, nil
 		}
@@ -160,20 +182,21 @@ func (n *Node) replicatePeer(ctx context.Context, peerID string) (bool, error) {
 			n.mu.Unlock()
 			return true, nil
 		}
+		// handle conflict hints from follower (keep existing logic, response fields map)
 		if resp.ConflictTerm == 0 {
 			n.mu.Lock()
-			n.nextIndex[peerID] = maxInt64(1, resp.ConflictIndex)
+			n.nextIndex[peerID] = maxInt64(1, int64(resp.ConflictIndex))
 			n.mu.Unlock()
 			continue
 		}
-		if backtrackIndex, ok := n.logStore.SearchLastTerm(resp.ConflictTerm); ok {
+		if backtrackIndex, ok := n.logStore.SearchLastTerm(int64(resp.ConflictTerm)); ok {
 			n.mu.Lock()
 			n.nextIndex[peerID] = backtrackIndex + 1
 			n.mu.Unlock()
 			continue
 		}
 		n.mu.Lock()
-		n.nextIndex[peerID] = maxInt64(1, resp.ConflictIndex)
+		n.nextIndex[peerID] = maxInt64(1, int64(resp.ConflictIndex))
 		n.mu.Unlock()
 	}
 	return false, fmt.Errorf("peer %s did not catch up", peerID)
@@ -192,7 +215,7 @@ func (n *Node) AppendEntries(ctx context.Context, req *kvgrpc.AppendEntriesReque
 		entries = append(entries, LogEntry{
 			Index: int64(entry.Index),
 			Term:  int64(entry.Term),
-			Op:    entry.Operation,
+			Op:    entry.Op,
 			Key:   entry.Key,
 			Value: entry.Value,
 			TTL:   entry.TTLSeconds,
@@ -208,6 +231,17 @@ func (n *Node) Heartbeat(ctx context.Context, req *kvgrpc.HeartbeatRequest) (*kv
 
 func (n *Node) RequestVote(ctx context.Context, req *kvgrpc.RequestVoteRequest) (*kvgrpc.RequestVoteResponse, error) {
 	return n.handleVoteRequest(req), nil
+}
+
+func (n *Node) InstallSnapshot(ctx context.Context, req *kvgrpc.SnapshotRequest) (*kvgrpc.SnapshotResponse, error) {
+	if req == nil {
+		return &kvgrpc.SnapshotResponse{Term: uint64(n.CurrentTerm())}, nil
+	}
+	// apply snapshot bytes and update state
+	if err := n.applySnapshotBytes(req.Data, int64(req.LastIncludedIndex), int64(req.LastIncludedTerm)); err != nil {
+		return &kvgrpc.SnapshotResponse{Term: uint64(n.CurrentTerm())}, err
+	}
+	return &kvgrpc.SnapshotResponse{Term: uint64(n.CurrentTerm())}, nil
 }
 
 func (n *Node) handleAppendEntries(term int64, leaderID string, prevLogIndex int64, prevLogTerm int64, entries []LogEntry, leaderCommit int64) (bool, int64, int64, int64) {
