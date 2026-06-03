@@ -2,7 +2,9 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,8 +37,8 @@ func (h *Handlers) Routes() http.Handler {
 }
 
 type kvPayload struct {
-	Value string `json:"value"`
-	TTL   string `json:"ttl,omitempty"`
+	Value string          `json:"value"`
+	TTL   json.RawMessage `json:"ttl,omitempty"`
 }
 
 func (h *Handlers) handleKV(w http.ResponseWriter, r *http.Request) {
@@ -67,8 +69,8 @@ func (h *Handlers) handleKV(w http.ResponseWriter, r *http.Request) {
 			h.writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
 			return
 		}
-		ttl, err := time.ParseDuration(payload.TTL)
-		if payload.TTL != "" && err != nil {
+		ttl, err := parseTTL(payload.TTL)
+		if err != nil {
 			h.writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid ttl"})
 			return
 		}
@@ -86,6 +88,38 @@ func (h *Handlers) handleKV(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func parseTTL(raw json.RawMessage) (time.Duration, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0, nil
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		if strings.TrimSpace(text) == "" {
+			return 0, nil
+		}
+		if duration, err := time.ParseDuration(text); err == nil {
+			return duration, nil
+		}
+		seconds, err := strconv.ParseFloat(text, 64)
+		if err != nil {
+			return 0, err
+		}
+		return secondsToDuration(seconds)
+	}
+	var seconds float64
+	if err := json.Unmarshal(raw, &seconds); err != nil {
+		return 0, err
+	}
+	return secondsToDuration(seconds)
+}
+
+func secondsToDuration(seconds float64) (time.Duration, error) {
+	if seconds < 0 {
+		return 0, fmt.Errorf("ttl must be non-negative")
+	}
+	return time.Duration(seconds * float64(time.Second)), nil
 }
 
 func (h *Handlers) handleHealth(w http.ResponseWriter, r *http.Request) {

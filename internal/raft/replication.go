@@ -210,6 +210,7 @@ func maxInt64(a, b int64) int64 {
 }
 
 func (n *Node) AppendEntries(ctx context.Context, req *kvgrpc.AppendEntriesRequest) (*kvgrpc.AppendEntriesResponse, error) {
+	n.metrics.IncGRPCRequest("append_entries", "received")
 	entries := make([]LogEntry, 0, len(req.Entries))
 	for _, entry := range req.Entries {
 		entries = append(entries, LogEntry{
@@ -222,25 +223,48 @@ func (n *Node) AppendEntries(ctx context.Context, req *kvgrpc.AppendEntriesReque
 		})
 	}
 	success, conflictIndex, conflictTerm, matchIndex := n.handleAppendEntries(int64(req.Term), req.LeaderID, int64(req.PrevLogIndex), int64(req.PrevLogTerm), entries, int64(req.LeaderCommit))
+	if success {
+		n.metrics.IncGRPCRequest("append_entries", "ok")
+	} else {
+		n.metrics.IncGRPCRequest("append_entries", "rejected")
+	}
 	return &kvgrpc.AppendEntriesResponse{Term: uint64(n.CurrentTerm()), Success: success, MatchIndex: uint64(matchIndex), ConflictIndex: uint64(conflictIndex), ConflictTerm: uint64(conflictTerm)}, nil
 }
 
 func (n *Node) Heartbeat(ctx context.Context, req *kvgrpc.HeartbeatRequest) (*kvgrpc.HeartbeatResponse, error) {
-	return n.handleLeaderHeartbeat(req), nil
+	n.metrics.IncGRPCRequest("heartbeat", "received")
+	resp := n.handleLeaderHeartbeat(req)
+	if resp.Accepted {
+		n.metrics.IncGRPCRequest("heartbeat", "ok")
+	} else {
+		n.metrics.IncGRPCRequest("heartbeat", "rejected")
+	}
+	return resp, nil
 }
 
 func (n *Node) RequestVote(ctx context.Context, req *kvgrpc.RequestVoteRequest) (*kvgrpc.RequestVoteResponse, error) {
-	return n.handleVoteRequest(req), nil
+	n.metrics.IncGRPCRequest("request_vote", "received")
+	resp := n.handleVoteRequest(req)
+	if resp.VoteGranted {
+		n.metrics.IncGRPCRequest("request_vote", "granted")
+	} else {
+		n.metrics.IncGRPCRequest("request_vote", "rejected")
+	}
+	return resp, nil
 }
 
 func (n *Node) InstallSnapshot(ctx context.Context, req *kvgrpc.SnapshotRequest) (*kvgrpc.SnapshotResponse, error) {
+	n.metrics.IncGRPCRequest("install_snapshot", "received")
 	if req == nil {
+		n.metrics.IncGRPCRequest("install_snapshot", "empty")
 		return &kvgrpc.SnapshotResponse{Term: uint64(n.CurrentTerm())}, nil
 	}
 	// apply snapshot bytes and update state
 	if err := n.applySnapshotBytes(req.Data, int64(req.LastIncludedIndex), int64(req.LastIncludedTerm)); err != nil {
+		n.metrics.IncGRPCRequest("install_snapshot", "error")
 		return &kvgrpc.SnapshotResponse{Term: uint64(n.CurrentTerm())}, err
 	}
+	n.metrics.IncGRPCRequest("install_snapshot", "ok")
 	return &kvgrpc.SnapshotResponse{Term: uint64(n.CurrentTerm())}, nil
 }
 

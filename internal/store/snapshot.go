@@ -28,8 +28,11 @@ type SnapshotRecord struct {
 }
 
 type SnapshotFile struct {
-	CreatedAt time.Time        `json:"created_at"`
-	Records   []SnapshotRecord `json:"records"`
+	CreatedAt         time.Time             `json:"created_at"`
+	LastIncludedIndex int64                 `json:"last_included_index"`
+	LastIncludedTerm  int64                 `json:"last_included_term"`
+	Entries           map[string]StoreEntry `json:"entries"`
+	Records           []SnapshotRecord      `json:"records,omitempty"`
 }
 
 func (e *Engine) TakeSnapshot(lastIncludedIndex int64, lastIncludedTerm int64) ([]byte, error) {
@@ -53,9 +56,13 @@ func (e *Engine) TakeSnapshot(lastIncludedIndex int64, lastIncludedTerm int64) (
 		}
 		entries[string(iter.Key())] = StoreEntry{Value: entry.Value, ExpiresAt: expiresAt}
 	}
-	_ = lastIncludedIndex
-	_ = lastIncludedTerm
-	payload, err := json.Marshal(entries)
+	snapshot := SnapshotFile{
+		CreatedAt:         time.Now().UTC(),
+		LastIncludedIndex: lastIncludedIndex,
+		LastIncludedTerm:  lastIncludedTerm,
+		Entries:           entries,
+	}
+	payload, err := json.Marshal(snapshot)
 	if err != nil {
 		return nil, err
 	}
@@ -81,19 +88,31 @@ func (e *Engine) ApplySnapshot(data []byte, lastIncludedIndex int64, lastInclude
 	if err != nil {
 		return err
 	}
-	entries := make(map[string]StoreEntry)
-	if err := json.Unmarshal(decoded, &entries); err != nil {
-		return err
-	}
-	// perform delete+put in a single atomic batch while holding engine lock
-	keys, err := e.Keys()
+	entries, snapshotIndex, snapshotTerm, err := decodeSnapshot(decoded)
 	if err != nil {
 		return err
 	}
-	batch := new(leveldb.Batch)
-	for _, key := range keys {
-		batch.Delete([]byte(key))
+	if lastIncludedIndex == 0 {
+		lastIncludedIndex = snapshotIndex
 	}
+	if lastIncludedTerm == 0 {
+		lastIncludedTerm = snapshotTerm
+	}
+
+	batch := new(leveldb.Batch)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	iter := e.db.NewIterator(nil, nil)
+	for iter.Next() {
+		batch.Delete(append([]byte(nil), iter.Key()...))
+	}
+	if err := iter.Error(); err != nil {
+		iter.Release()
+		return err
+	}
+	iter.Release()
+
 	for key, entry := range entries {
 		state := Entry{Key: key, Value: entry.Value, UpdatedAt: time.Now().UTC()}
 		if entry.ExpiresAt > 0 {
@@ -106,18 +125,30 @@ func (e *Engine) ApplySnapshot(data []byte, lastIncludedIndex int64, lastInclude
 		}
 		batch.Put([]byte(key), payload)
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	if err := e.db.Write(batch, nil); err != nil {
 		return err
 	}
-	_ = lastIncludedIndex
-	_ = lastIncludedTerm
+	e.snapshotIndex = lastIncludedIndex
+	e.snapshotTerm = lastIncludedTerm
 	return nil
 }
 
+func decodeSnapshot(decoded []byte) (map[string]StoreEntry, int64, int64, error) {
+	var snapshot SnapshotFile
+	if err := json.Unmarshal(decoded, &snapshot); err == nil && snapshot.Entries != nil {
+		return snapshot.Entries, snapshot.LastIncludedIndex, snapshot.LastIncludedTerm, nil
+	}
+
+	legacy := make(map[string]StoreEntry)
+	if err := json.Unmarshal(decoded, &legacy); err != nil {
+		return nil, 0, 0, err
+	}
+	return legacy, 0, 0, nil
+}
+
 func (e *Engine) createSnapshot() error {
-	data, err := e.TakeSnapshot(0, 0)
+	snapshotIndex, snapshotTerm := e.SnapshotPosition()
+	data, err := e.TakeSnapshot(snapshotIndex, snapshotTerm)
 	if err != nil {
 		return err
 	}

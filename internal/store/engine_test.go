@@ -34,3 +34,27 @@ func TestEngineSetGetDelete(t *testing.T) {
 	_, err = engine.Get("k")
 	require.ErrorIs(t, err, ErrNotFound)
 }
+
+func TestSnapshotRestoresRaftPosition(t *testing.T) {
+	dir := t.TempDir()
+	engine, err := NewEngine(filepath.Join(dir, "source"), 10)
+	require.NoError(t, err)
+	require.NoError(t, engine.Set("k", "v", 0))
+
+	data, err := engine.TakeSnapshot(42, 7)
+	require.NoError(t, err)
+	require.NoError(t, engine.Close())
+
+	restored, err := NewEngine(filepath.Join(dir, "restored"), 10)
+	require.NoError(t, err)
+	defer restored.Close()
+
+	require.NoError(t, restored.ApplySnapshot(data, 0, 0))
+	index, term := restored.SnapshotPosition()
+	require.Equal(t, int64(42), index)
+	require.Equal(t, int64(7), term)
+
+	entry, err := restored.Get("k")
+	require.NoError(t, err)
+	require.Equal(t, "v", entry.Value)
+}

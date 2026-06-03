@@ -39,23 +39,23 @@ type Node struct {
 	clients  *kvgrpc.Client
 	logStore *LogStore
 
-	mu             sync.RWMutex
-	state          Role
-	currentTerm    int64
-	votedFor       string
-	leaderID       string
-	commitIndex    int64
-	lastApplied    int64
-	snapshotIndex  int64
-	snapshotTerm   int64
-	nextIndex      map[string]int64
-	matchIndex     map[string]int64
-	lastHeartbeat  time.Time
-	started        bool
-	metrics        *Metrics
-	commitCh       chan int64
-	stopCh         chan struct{}
-	replicateCh    map[string]chan struct{}
+	mu            sync.RWMutex
+	state         Role
+	currentTerm   int64
+	votedFor      string
+	leaderID      string
+	commitIndex   int64
+	lastApplied   int64
+	snapshotIndex int64
+	snapshotTerm  int64
+	nextIndex     map[string]int64
+	matchIndex    map[string]int64
+	lastHeartbeat time.Time
+	started       bool
+	metrics       *Metrics
+	commitCh      chan int64
+	stopCh        chan struct{}
+	replicateCh   map[string]chan struct{}
 }
 
 func NewNode(cfg config.Config, engine *store.Engine, ring *hash.Ring, clients *kvgrpc.Client) *Node {
@@ -81,6 +81,11 @@ func NewNode(cfg config.Config, engine *store.Engine, ring *hash.Ring, clients *
 		if votedFor, err := logStore.LoadVotedFor(); err == nil {
 			node.votedFor = votedFor
 		}
+	}
+	if engine != nil {
+		node.snapshotIndex, node.snapshotTerm = engine.SnapshotPosition()
+		node.commitIndex = node.snapshotIndex
+		node.lastApplied = node.snapshotIndex
 	}
 	node.resetReplicationStateLocked()
 	return node
@@ -166,14 +171,17 @@ func (n *Node) Status() map[string]any {
 		"term":           n.currentTerm,
 		"leader_id":      n.leaderID,
 		"commit_index":   n.commitIndex,
-		"last_applied":    n.lastApplied,
-		"snapshot_index":  n.snapshotIndex,
-		"snapshot_term":   n.snapshotTerm,
-		"last_heartbeat":  n.lastHeartbeat,
+		"last_applied":   n.lastApplied,
+		"snapshot_index": n.snapshotIndex,
+		"snapshot_term":  n.snapshotTerm,
+		"last_heartbeat": n.lastHeartbeat,
 	}
 }
 
 func (n *Node) routeWriteTarget(key string) string {
+	if n.ring == nil {
+		return n.LeaderID()
+	}
 	if owner, ok := n.ring.GetNode(key); ok {
 		return owner.ID
 	}
@@ -181,6 +189,9 @@ func (n *Node) routeWriteTarget(key string) string {
 }
 
 func (n *Node) routeReadTarget(key string) string {
+	if n.ring == nil {
+		return n.LeaderID()
+	}
 	if owner, ok := n.ring.GetNode(key); ok {
 		return owner.ID
 	}
@@ -212,11 +223,48 @@ func (n *Node) resetReplicationStateLocked() {
 }
 
 func (n *Node) clusterPeers() []hash.PhysicalNode {
+	if n.ring == nil {
+		return nil
+	}
 	return n.ring.Nodes()
 }
 
 func (n *Node) replicaSetFor(key string) []hash.PhysicalNode {
+	if n.ring == nil {
+		return nil
+	}
 	return n.ring.GetReplicaSet(key)
+}
+
+func (n *Node) orderedReplicaSet(key, primaryID string) []hash.PhysicalNode {
+	replicas := n.replicaSetFor(key)
+	if primaryID == "" || len(replicas) == 0 {
+		return replicas
+	}
+	for i, replica := range replicas {
+		if replica.ID != primaryID {
+			continue
+		}
+		ordered := make([]hash.PhysicalNode, 0, len(replicas))
+		ordered = append(ordered, replica)
+		ordered = append(ordered, replicas[:i]...)
+		ordered = append(ordered, replicas[i+1:]...)
+		return ordered
+	}
+	return replicas
+}
+
+func (n *Node) isReplicaForKey(key string) bool {
+	replicas := n.replicaSetFor(key)
+	if len(replicas) == 0 {
+		return true
+	}
+	for _, replica := range replicas {
+		if replica.ID == n.cfg.NodeID {
+			return true
+		}
+	}
+	return false
 }
 
 func (n *Node) signalCommit(index int64) {
@@ -475,6 +523,9 @@ func (n *Node) signalHeartbeat() {
 func (n *Node) applyEntry(entry LogEntry) error {
 	switch entry.Op {
 	case "set", "SET":
+		if !n.isReplicaForKey(entry.Key) {
+			return n.engine.Delete(entry.Key)
+		}
 		return n.engine.Set(entry.Key, entry.Value, time.Duration(entry.TTL)*time.Second)
 	case "delete", "DELETE":
 		return n.engine.Delete(entry.Key)
@@ -485,69 +536,115 @@ func (n *Node) applyEntry(entry LogEntry) error {
 
 func (n *Node) Get(ctx context.Context, key string) (store.Entry, error) {
 	start := time.Now()
-	defer func() {
-		n.writeLatency("get", start, "ok")
-	}()
-	if !n.IsLeader() && n.LeaderID() != "" && n.LeaderID() != n.cfg.NodeID {
-		resp, err := n.clients.Read(ctx, n.LeaderID(), &kvgrpc.ReadRequest{Key: key})
-		if err != nil {
-			return store.Entry{}, err
-		}
-		if !resp.Found {
-			return store.Entry{}, store.ErrNotFound
-		}
-		entry := store.Entry{Key: key, Value: resp.Value, Deleted: resp.Deleted}
-		return entry, nil
+	entry, err := n.getRouted(ctx, key)
+	if err != nil {
+		n.writeLatency("get", start, "error")
+		return store.Entry{}, err
 	}
-	entry, err := n.engine.Get(key)
+	n.writeLatency("get", start, "ok")
+	return entry, nil
+}
+
+func (n *Node) getRouted(ctx context.Context, key string) (store.Entry, error) {
+	replicas := n.orderedReplicaSet(key, n.routeReadTarget(key))
+	if len(replicas) == 0 {
+		return n.engine.Get(key)
+	}
+	var lastErr error
+	for _, replica := range replicas {
+		if replica.ID == n.cfg.NodeID {
+			entry, err := n.engine.Get(key)
+			if err == nil {
+				return entry, nil
+			}
+			lastErr = err
+			continue
+		}
+		entry, err := n.readFromPeer(ctx, replica.ID, key)
+		if err == nil {
+			return entry, nil
+		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		return store.Entry{}, lastErr
+	}
+	return store.Entry{}, store.ErrNotFound
+}
+
+func (n *Node) readFromPeer(ctx context.Context, peerID, key string) (store.Entry, error) {
+	resp, err := n.clients.Read(ctx, peerID, &kvgrpc.ReadRequest{Key: key})
 	if err != nil {
 		return store.Entry{}, err
+	}
+	if !resp.Found {
+		return store.Entry{}, store.ErrNotFound
+	}
+	entry := store.Entry{Key: key, Value: resp.Value, Deleted: resp.Deleted}
+	if !resp.ExpiresAt.IsZero() {
+		expiresAt := resp.ExpiresAt
+		entry.ExpiresAt = &expiresAt
 	}
 	return entry, nil
 }
 
 func (n *Node) Write(ctx context.Context, key, value string, ttl time.Duration) error {
 	start := time.Now()
-	defer func() {
-		n.writeLatency("set", start, "ok")
-	}()
-	if !n.IsLeader() {
-		leader := n.LeaderID()
-		if leader == "" || leader == n.cfg.NodeID {
-			return errors.New("not leader")
-		}
-		resp, err := n.clients.Propose(ctx, leader, &kvgrpc.ProposeRequest{Key: key, Value: value, Operation: "set", TTLSeconds: int64(ttl.Seconds())})
-		if err != nil {
-			return err
-		}
-		if !resp.Success {
-			return errors.New(resp.Error)
-		}
-		return nil
+	if err := n.submitCommand(ctx, "set", key, value, ttl, true); err != nil {
+		n.writeLatency("set", start, "error")
+		return err
 	}
-	return n.proposeCommand(ctx, "set", key, value, ttl)
+	n.writeLatency("set", start, "ok")
+	return nil
 }
 
 func (n *Node) Delete(ctx context.Context, key string) error {
 	start := time.Now()
-	defer func() {
-		n.writeLatency("delete", start, "ok")
-	}()
+	if err := n.submitCommand(ctx, "delete", key, "", 0, true); err != nil {
+		n.writeLatency("delete", start, "error")
+		return err
+	}
+	n.writeLatency("delete", start, "ok")
+	return nil
+}
+
+func (n *Node) submitCommand(ctx context.Context, op, key, value string, ttl time.Duration, enforceOwner bool) error {
+	if enforceOwner {
+		var lastErr error
+		for _, replica := range n.orderedReplicaSet(key, n.routeWriteTarget(key)) {
+			if replica.ID == n.cfg.NodeID {
+				lastErr = nil
+				break
+			}
+			if err := n.forwardProposal(ctx, replica.ID, op, key, value, ttl); err != nil {
+				lastErr = err
+				continue
+			}
+			return nil
+		}
+		if lastErr != nil {
+			return lastErr
+		}
+	}
 	if !n.IsLeader() {
 		leader := n.LeaderID()
 		if leader == "" || leader == n.cfg.NodeID {
 			return errors.New("not leader")
 		}
-		resp, err := n.clients.Propose(ctx, leader, &kvgrpc.ProposeRequest{Key: key, Operation: "delete"})
-		if err != nil {
-			return err
-		}
-		if !resp.Success {
-			return errors.New(resp.Error)
-		}
-		return nil
+		return n.forwardProposal(ctx, leader, op, key, value, ttl)
 	}
-	return n.proposeCommand(ctx, "delete", key, "", 0)
+	return n.proposeCommand(ctx, op, key, value, ttl)
+}
+
+func (n *Node) forwardProposal(ctx context.Context, peerID, op, key, value string, ttl time.Duration) error {
+	resp, err := n.clients.Propose(ctx, peerID, &kvgrpc.ProposeRequest{Key: key, Value: value, Operation: op, TTLSeconds: int64(ttl.Seconds())})
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return errors.New(resp.Error)
+	}
+	return nil
 }
 
 func (n *Node) proposeCommand(ctx context.Context, op, key, value string, ttl time.Duration) error {
@@ -589,13 +686,16 @@ func (n *Node) proposeCommand(ctx context.Context, op, key, value string, ttl ti
 }
 
 func (n *Node) ReadRPC(ctx context.Context, req *kvgrpc.ReadRequest) (*kvgrpc.ReadResponse, error) {
-	entry, err := n.Get(ctx, req.Key)
+	entry, err := n.engine.Get(req.Key)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
+			n.metrics.IncGRPCRequest("read", "not_found")
 			return &kvgrpc.ReadResponse{Found: false}, nil
 		}
+		n.metrics.IncGRPCRequest("read", "error")
 		return nil, err
 	}
+	n.metrics.IncGRPCRequest("read", "ok")
 	resp := &kvgrpc.ReadResponse{Found: true, Value: entry.Value, Deleted: entry.Deleted}
 	if entry.ExpiresAt != nil {
 		resp.ExpiresAt = *entry.ExpiresAt
@@ -604,15 +704,19 @@ func (n *Node) ReadRPC(ctx context.Context, req *kvgrpc.ReadRequest) (*kvgrpc.Re
 }
 
 func (n *Node) ProposeRPC(ctx context.Context, req *kvgrpc.ProposeRequest) (*kvgrpc.ProposeResponse, error) {
+	n.metrics.IncGRPCRequest("propose", "received")
 	if req.Operation == "delete" {
-		if err := n.Delete(ctx, req.Key); err != nil {
+		if err := n.submitCommand(ctx, "delete", req.Key, "", 0, false); err != nil {
+			n.metrics.IncGRPCRequest("propose", "error")
 			return &kvgrpc.ProposeResponse{Success: false, LeaderID: n.LeaderID(), Error: err.Error()}, nil
 		}
 	} else {
-		if err := n.Write(ctx, req.Key, req.Value, time.Duration(req.TTLSeconds)*time.Second); err != nil {
+		if err := n.submitCommand(ctx, "set", req.Key, req.Value, time.Duration(req.TTLSeconds)*time.Second, false); err != nil {
+			n.metrics.IncGRPCRequest("propose", "error")
 			return &kvgrpc.ProposeResponse{Success: false, LeaderID: n.LeaderID(), Error: err.Error()}, nil
 		}
 	}
+	n.metrics.IncGRPCRequest("propose", "ok")
 	return &kvgrpc.ProposeResponse{Success: true, LeaderID: n.cfg.NodeID}, nil
 }
 
@@ -623,16 +727,7 @@ func (n *Node) HealthRPC(ctx context.Context, req *struct{}) (*kvgrpc.HealthResp
 }
 
 func (n *Node) Propose(ctx context.Context, req *kvgrpc.ProposeRequest) (*kvgrpc.ProposeResponse, error) {
-	if req.Operation == "delete" {
-		if err := n.Delete(ctx, req.Key); err != nil {
-			return &kvgrpc.ProposeResponse{Success: false, LeaderID: n.LeaderID(), Error: err.Error()}, nil
-		}
-	} else {
-		if err := n.Write(ctx, req.Key, req.Value, time.Duration(req.TTLSeconds)*time.Second); err != nil {
-			return &kvgrpc.ProposeResponse{Success: false, LeaderID: n.LeaderID(), Error: err.Error()}, nil
-		}
-	}
-	return &kvgrpc.ProposeResponse{Success: true, LeaderID: n.cfg.NodeID}, nil
+	return n.ProposeRPC(ctx, req)
 }
 
 func (n *Node) Read(ctx context.Context, req *kvgrpc.ReadRequest) (*kvgrpc.ReadResponse, error) {

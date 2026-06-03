@@ -43,7 +43,10 @@ func BenchmarkGet(b *testing.B) {
 			return err
 		}
 		defer resp.Body.Close()
-		_, _ = io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode >= http.StatusBadRequest {
+			return fmt.Errorf("set failed with %d: %s", resp.StatusCode, string(body))
+		}
 		return nil
 	})
 }
@@ -73,8 +76,11 @@ func BenchmarkParallelGet(b *testing.B) {
 			key := fmt.Sprintf("bench-key-%d", rand.Intn(benchmarkKeyCount))
 			resp, err := benchmarkClient.Get(benchmarkBaseURL + "/kv/" + key)
 			if err == nil {
-				_, _ = io.ReadAll(resp.Body)
+				body, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
+				if resp.StatusCode >= http.StatusBadRequest {
+					b.Errorf("parallel set failed with %d: %s", resp.StatusCode, string(body))
+				}
 			}
 			hist.RecordValue(time.Since(start).Microseconds())
 		}
@@ -123,8 +129,11 @@ func BenchmarkMixedReadWrite(b *testing.B) {
 				req.Header.Set("Content-Type", "application/json")
 				resp, err := benchmarkClient.Do(req)
 				if err == nil {
-					_, _ = io.ReadAll(resp.Body)
+					body, _ := io.ReadAll(resp.Body)
 					resp.Body.Close()
+					if resp.StatusCode >= http.StatusBadRequest {
+						b.Errorf("mixed set failed with %d: %s", resp.StatusCode, string(body))
+					}
 				}
 			}
 			hist.RecordValue(time.Since(start).Microseconds())
@@ -190,8 +199,11 @@ func prepopulateKeys() error {
 		if err != nil {
 			return err
 		}
-		_, _ = io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		if resp.StatusCode >= http.StatusBadRequest {
+			return fmt.Errorf("prepopulate failed with %d: %s", resp.StatusCode, string(body))
+		}
 	}
 	return nil
 }

@@ -25,12 +25,14 @@ type Entry struct {
 }
 
 type Engine struct {
-	mu                 sync.RWMutex
-	db                 *leveldb.DB
-	dataDir            string
-	snapshotDir        string
-	snapshotThreshold  int
-	writeCount         atomic.Uint64
+	mu                sync.RWMutex
+	db                *leveldb.DB
+	dataDir           string
+	snapshotDir       string
+	snapshotThreshold int
+	snapshotIndex     int64
+	snapshotTerm      int64
+	writeCount        atomic.Uint64
 }
 
 func NewEngine(dataDir string, snapshotThreshold int) (*Engine, error) {
@@ -117,10 +119,18 @@ func (e *Engine) Keys() ([]string, error) {
 func (e *Engine) Stats() map[string]any {
 	keys, _ := e.Keys()
 	return map[string]any{
-		"keys":     len(keys),
-		"data_dir": e.dataDir,
-		"writes":   e.writeCount.Load(),
+		"keys":           len(keys),
+		"data_dir":       e.dataDir,
+		"writes":         e.writeCount.Load(),
+		"snapshot_index": e.snapshotIndex,
+		"snapshot_term":  e.snapshotTerm,
 	}
+}
+
+func (e *Engine) SnapshotPosition() (int64, int64) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.snapshotIndex, e.snapshotTerm
 }
 
 func (e *Engine) storeEntry(entry Entry, ttl time.Duration) error {
